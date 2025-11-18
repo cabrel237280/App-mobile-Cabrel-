@@ -423,3 +423,211 @@
   </script>
 </body>
 </html>
+// server.js
+require('dotenv').config();
+const express = require('express');
+const bodyParser = require('body-parser');
+const paypal = require('./payments/paypal');
+const momo = require('./payments/momo');
+const orange = require('./payments/orange');
+
+const app = express();
+app.use(bodyParser.json());
+
+// Basic health
+app.get('/api/health', (req,res) => res.json({ok:true, ts: Date.now()}));
+
+/* ---------------- PayPal ---------------- */
+// create order (frontend calls this to get approval URL or orderId)
+app.post('/api/payments/paypal/create-order', async (req, res) => {
+  try {
+    const { amount, currency = 'XAF', metadata } = req.body;
+    if(!amount) return res.status(400).json({ error: 'amount required' });
+
+    const order = await paypal.createOrder({ amount, currency, metadata });
+    // return the order id (client will redirect / use PayPal SDK)
+    return res.json(order);
+  } catch(err) {
+    console.error(err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// capture order (server-to-server after buyer approved)
+app.post('/api/payments/paypal/capture-order', async (req, res) => {
+  try {
+    const { orderId } = req.body;
+    if(!orderId) return res.status(400).json({ error: 'orderId required' });
+    const capture = await paypal.captureOrder(orderId);
+    // TODO: validate capture.status === 'COMPLETED', mark transaction in DB
+    return res.json(capture);
+  } catch(err) {
+    console.error(err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ---------------- MTN MoMo ---------------- */
+// Initiate MoMo collection (customer pays from their wallet)
+// This will depend on MTN's specific API (collection vs disbursement)
+app.post('/api/payments/momo/initiate', async (req, res) => {
+  try {
+    const { amount, currency='XAF', msisdn, externalId } = req.body;
+    if(!amount || !msisdn) return res.status(400).json({ error:'amount & msisdn required' });
+
+    const resp = await momo.initiateCollection({ amount, currency, msisdn, externalId });
+    // resp will include transactionId or requestId to poll/check
+    return res.json(resp);
+  } catch(err){
+    console.error(err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// check status (poll or webhook-based in production)
+app.get('/api/payments/momo/status/:requestId', async (req,res) => {
+  try {
+    const status = await momo.checkStatus(req.params.requestId);
+    return res.json(status);
+  } catch(err){
+    console.error(err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ---------------- Orange Money WebPay ---------------- */
+app.post('/api/payments/orange/initiate', async (req,res) => {
+  try {
+    const { amount, currency='XAF', msisdn, orderId } = req.body;
+    if(!amount) return res.status(400).json({ error:'amount required' });
+    const resp = await orange.initiatePayment({ amount, currency, msisdn, orderId });
+    return res.json(resp);
+  } catch(err){
+    console.error(err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ---------------- Webhook (generic example) ---------------- */
+app.post('/api/webhooks/payments', (req,res) => {
+  // IMPORTANT: verify signature from provider before trusting payload
+  const event = req.body;
+  console.log('Webhook received:', event);
+  // Example: if PayPal capture completed -> mark blog as unlocked for the user
+  // TODO: validate and then update DB
+  res.status(200).send('ok');
+});
+
+const PORT = process.env.PORT || 4000;
+app.listen(PORT, ()=> console.log('Server listening on', PORT));
+// payments/paypal.js
+const fetch = require('node-fetch');
+
+const PAYPAL_BASE = process.env.PAYPAL_BASE || 'https://api-m.sandbox.paypal.com';
+const CLIENT_ID = process.env.PAYPAL_CLIENT_ID;
+const CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET;
+
+async function getAccessToken(){
+  const basic = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString('base64');
+  const r = await fetch(`${PAYPAL_BASE}/v1/oauth2/token`, {
+    method: 'POST',
+    headers: { 'Authorization': `Basic ${basic}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'grant_type=client_credentials'
+  });
+  if(!r.ok) throw new Error('Cannot get PayPal token: ' + r.status);
+  const j = await r.json();
+  return j.access_token;
+}
+
+/**
+ * createOrder: create an order with PayPal Orders API
+ * returns the order JSON (including id and links)
+ */
+async function createOrder({ amount, currency='XAF', metadata }){
+  const token = await getAccessToken();
+  const r = await fetch(`${PAYPAL_BASE}/v2/checkout/orders`, {
+    method:'POST',
+    headers: {
+      'Content-Type':'application/json',
+      'Authorization': `Bearer ${token}`
+    },
+    body: JSON.stringify({
+      intent: 'CAPTURE',
+      purchase_units: [{ amount: { currency_code: currency, value: String(amount) }, custom_id: metadata?.externalId || undefined }]
+    })
+  });
+  if(!r.ok) {
+    const txt = await r.text();
+    throw new Error('PayPal create order failed: ' + txt);
+  }
+  return r.json();
+}
+
+/**
+ * captureOrder: capture payment for an approved order id
+ */
+async function captureOrder(orderId){
+  const token = await getAccessToken();
+  const r = await fetch(`${PAYPAL_BASE}/v2/checkout/orders/${orderId}/capture`, {
+    method:'POST',
+    headers:{
+      'Content-Type':'application/json',
+      'Authorization': `Bearer ${token}`
+    }
+  });
+  if(!r.ok){
+    const txt = await r.text();
+    throw new Error('PayPal capture failed: ' + txt);
+  }
+  return r.json();
+}
+
+module.exports = { createOrder, captureOrder };
+// payments/momo.js
+// NOTE: MTN MoMo uses different APIs per market (collection, disbursement, remittance).
+// Use momodeveloper.mtn.com docs to get exact endpoints for your country and sandbox keys.
+// Reference: https://momodeveloper.mtn.com/ (see API docs).  [oai_citation:4‡Developer portal - Test environment](https://momodeveloper.mtn.com/api-documentation?utm_source=chatgpt.com)
+
+const fetch = require('node-fetch');
+const MTN_BASE = process.env.MTN_BASE || 'https://sandbox.momodeveloper.mtn.com';
+const SUBSCRIPTION_KEY = process.env.MTN_SUBSCRIPTION_KEY;
+
+async function initiateCollection({ amount, currency='XAF', msisdn, externalId }){
+  // This is pseudo-code. On real MTN, you'd:
+  // 1) authenticate (obtain API key/ token or use subscription key header)
+  // 2) POST to /collection/v1_0/requesttopay with amount, msisdn, externalId
+  // 3) return the requestId to frontend to poll status or rely on webhook.
+  // Check MTN docs for exact fields and headers.
+  return { ok:true, requestId: 'demo-'+Date.now(), message:'demo initiated (check MTN docs)' };
+}
+
+async function checkStatus(requestId){
+  // call the status endpoint provided by MTN for that requestId
+  return { ok:true, status:'COMPLETED', requestId };
+}
+
+module.exports = { initiateCollection, checkStatus };
+// payments/orange.js
+// Orange WebPay flow typically:
+// - Get OAuth token with client id/secret
+// - POST a payment request to the WebPay endpoint
+// - get back a transaction id and a redirect or status to poll
+// See Orange Developer docs for exact endpoints and parameters.  [oai_citation:5‡Orange Developer](https://developer.orange.com/apis/om-webpay?utm_source=chatgpt.com)
+
+const fetch = require('node-fetch');
+const ORANGE_BASE = process.env.ORANGE_BASE || 'https://api.orange.com';
+const CLIENT_ID = process.env.ORANGE_CLIENT_ID;
+const CLIENT_SECRET = process.env.ORANGE_CLIENT_SECRET;
+
+async function getOAuthToken(){
+  // Example: POST /oauth/v3/token (depending on Orange region)
+  // This is placeholder; check Orange docs for token endpoint and grant_type
+  return 'demo-token';
+}
+
+async function initiatePayment({ amount, currency='XAF', msisdn, orderId }){
+  // placeholder: real implementation uses token and WebPay endpoint
+  return { ok:true, paymentId: 'orange-'+Date.now(), message:'demo initiated (check Orange docs)' };
+}
+
+module.exports = { initiatePayment, getOAuthToken };
